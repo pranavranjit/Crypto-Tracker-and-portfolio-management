@@ -198,8 +198,8 @@ def stage2_add_columns(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-# --------------------------- VADER + crypto tweaks
-CRYPTO_VADER_TERMS = {"hodl": 2.6, "bullish": 1.9, "bearish": -1.9, "rekt": -2.8}
+# --------------------------- VADER + market tweaks
+MARKET_VADER_TERMS = {"hodl": 2.6, "bullish": 1.9, "bearish": -1.9, "rekt": -2.8}
 PHRASE_TOKENS_VALENCE = {"rug_pull": -3.2, "all_time_high": 2.6, "all_time_low": -2.6}
 
 def get_vader(custom_unigrams=None, phrase_tokens=None) -> SentimentIntensityAnalyzer:
@@ -210,7 +210,7 @@ def get_vader(custom_unigrams=None, phrase_tokens=None) -> SentimentIntensityAna
         a.lexicon.update({k.lower(): float(v) for k, v in phrase_tokens.items()})
     return a
 
-_VADER = get_vader(CRYPTO_VADER_TERMS, PHRASE_TOKENS_VALENCE)
+_VADER = get_vader(MARKET_VADER_TERMS, PHRASE_TOKENS_VALENCE)
 
 def _vader_scores(txt: str) -> pd.Series:
     return pd.Series(_VADER.polarity_scores(str(txt)))
@@ -238,6 +238,9 @@ def stage3_sentiment_and_plots(
     logging.info("Stage 3 – VADER, filters, plots")
 
     df = df_clean.copy()
+    # coerce date column to datetimelike early to avoid .dt errors downstream
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df[["neg", "neu", "pos", "compound"]] = df["all_text"].progress_apply(_vader_scores)
 
     df_thr   = df.loc[df["compound"].abs() >= thr].copy()
@@ -272,7 +275,8 @@ def _hist_grid(df: pd.DataFrame, fname: Path, title: str) -> None:
 def _daily_line(df: pd.DataFrame, fname: Path) -> None:
     if df.empty: return
     daily = df.groupby("date")["compound_pct"].mean().reset_index()
-    daily["date"] = pd.to_datetime(daily["date"]); daily = daily.sort_values("date")
+    daily["date"] = pd.to_datetime(daily["date"], errors="coerce")
+    daily = daily.dropna(subset=["date"]).sort_values("date")
     plt.figure(figsize=(15,8))
     plt.plot(daily["date"], daily["compound_pct"], linewidth=1.5, color="#2E86AB")
     plt.fill_between(daily["date"], daily["compound_pct"], color="#2E86AB", alpha=0.3)
@@ -286,7 +290,8 @@ def _daily_line(df: pd.DataFrame, fname: Path) -> None:
 def _heatmap(df: pd.DataFrame, fname: Path) -> None:
     if df.empty: return
     daily = df.groupby("date")["compound_pct"].mean().reset_index()
-    daily["date"] = pd.to_datetime(daily["date"])
+    daily["date"] = pd.to_datetime(daily["date"], errors="coerce")
+    daily = daily.dropna(subset=["date"]).sort_values("date")
     daily["year"] = daily["date"].dt.year; daily["month"] = daily["date"].dt.month
     pivot = daily.groupby(["year","month"])["compound_pct"].mean().unstack().sort_index(ascending=False)
     plt.figure(figsize=(12,8))
@@ -301,7 +306,11 @@ def _heatmap(df: pd.DataFrame, fname: Path) -> None:
 
 def _fear_greed_gauge(df: pd.DataFrame, fname: Path) -> None:
     if df.empty: return
-    dmax = pd.to_datetime(max(df["date"]))
+    # ensure date is datetime
+    df = df.copy()
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    dmax = pd.to_datetime(df["date"].max())
     recent = df[pd.to_datetime(df["date"]) >= dmax - pd.Timedelta(days=6)]
     avg = float(recent["compound_pct"].mean())
 
@@ -350,3 +359,88 @@ def stage4_confusion(df_sent: pd.DataFrame, dirs: Dict[str, Path]) -> None:
     rep = classification_report(df["positive"], df["predicted_positive"])
     (dirs["fig_dir"] / "classification_report.txt").write_text(rep)
     logging.info("Stage 4 finished (%.2fs)", time.time() - tic)
+
+
+# --------------------------- Convenience pipeline API (end-to-end)
+def _compute_regime_signals(df_final: pd.DataFrame) -> Dict[str, object]:
+    """Compute compact regime signals for dashboards.
+
+    Returns a dict with:
+      - last7_avg_pct: average compound_pct over last 7 days (0-100)
+      - ema_now: exponential moving average (span=7) of daily compound_pct
+      - latest_date: most recent date in the timeseries
+      - timeseries: pd.DataFrame with daily compound_pct
+    """
+    out = {
+        "last7_avg_pct": None,
+        "ema_now": None,
+        "latest_date": None,
+        "timeseries": pd.DataFrame(),
+    }
+    if df_final is None or df_final.empty:
+        return out
+
+    daily = df_final.groupby("date")["compound_pct"].mean().reset_index()
+    daily["date"] = pd.to_datetime(daily["date"], errors="coerce")
+    daily = daily.dropna(subset=["date"]).sort_values("date")
+    if daily.empty:
+        return out
+
+    # last 7-day average (use last available 7 calendar days if possible)
+    last_date = pd.to_datetime(daily["date"]).max()
+    window_start = last_date - pd.Timedelta(days=6)
+    last7 = daily.loc[pd.to_datetime(daily["date"]) >= window_start]["compound_pct"]
+    out["last7_avg_pct"] = float(last7.mean()) if not last7.empty else float(daily["compound_pct"].tail(7).mean())
+
+    # EMA (span 7) computed on daily series
+    daily = daily.set_index("date")
+    ema = daily["compound_pct"].ewm(span=7, adjust=False).mean()
+    out["ema_now"] = float(ema.iloc[-1])
+    out["latest_date"] = pd.to_datetime(daily.index.max())
+    out["timeseries"] = daily.reset_index()
+    return out
+
+
+def run_sentiment_pipeline(
+    *,
+    api_key: Optional[str] = None,
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+    base_dir: Optional[str | Path] = None,
+    filename_stage1: str = "stage_1_news_raw.csv",
+    filename_stage3: str = "clean_news_timeseries.csv",
+) -> Dict[str, object]:
+    """Run the full sentiment pipeline and return summary signals.
+
+    Steps:
+      1. ensure stage1 CSV exists (download if missing)
+      2. stage2 text preprocessing
+      3. stage3 VADER scoring + plots
+      4. compute compact regime signals
+
+    Returns a dict with keys: 'signals' (dict), 'paths' (dict), 'df_final' (DataFrame)
+    """
+    # defaults: last 365 days if not provided
+    if end_dt is None:
+        end_dt = datetime.utcnow()
+    if start_dt is None:
+        start_dt = end_dt - timedelta(days=365)
+
+    dirs = build_week_dirs(base_dir, results_folder="week8", data_sub="news_clean_data")
+    data_dir = dirs["data_dir"]
+
+    # Stage 1: download / ensure CSV
+    df_stage1 = ensure_stage1_csv_once(
+        api_key=api_key, start_dt=start_dt, end_dt=end_dt, data_dir=data_dir, filename=filename_stage1
+    )
+
+    # Stage 2: preprocess
+    df_stage2 = stage2_add_columns(df_stage1)
+
+    # Stage 3: sentiment, plots, and final CSV
+    df_final = stage3_sentiment_and_plots(df_stage2, dirs, thr=0.05)
+
+    # compute signals
+    signals = _compute_regime_signals(df_final)
+
+    return {"signals": signals, "paths": {"stage1": str(data_dir / filename_stage1), "stage3": str(dirs["data_dir"] / filename_stage3)}, "df_final": df_final}

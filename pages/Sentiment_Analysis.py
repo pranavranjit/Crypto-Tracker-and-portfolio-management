@@ -9,7 +9,7 @@ import streamlit as st
 import pages.cores.run_sentiment_pipeline as run_sentiment_pipeline
 
 st.set_page_config(page_title="Sentiment", layout="wide")
-st.title("📰 Market Sentiment")
+st.title(" Market Sentiment")
 
 # ===========================
 

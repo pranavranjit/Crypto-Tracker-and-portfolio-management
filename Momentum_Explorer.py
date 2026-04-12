@@ -6,16 +6,16 @@ from typing import Optional, Tuple, Dict, List
 import traceback
 
 # Project imports
-from pages.cores.crypto_pipeline import build_week_dirs
 from pages.cores.runners import multi_symbol_rotation_by_model
 from pages.cores.reader import getSymbolToDf
 from pages.cores.commons import FEATURES, MODELS
-from pages.cores import run_crypto_pipeline
+from pages.cores.sentiment_pipeline import run_sentiment_pipeline
 
 import plotly.graph_objects as go
+import plotly.express as px
 
-st.set_page_config(page_title="Momentum Explorer", layout="wide")
-st.title("Momentum Explorer Dashboard for Crypto")
+st.set_page_config(page_title="Mutual Fund Momentum Explorer", layout="wide")
+st.title("Momentum Explorer Dashboard for Mutual Funds")
 
 
 m_labels = {
@@ -34,13 +34,74 @@ f_labels = {
 
 @st.cache_data(show_spinner=False)
 def download_data():
-    return run_crypto_pipeline.main()
+    # Use the mutual-fund CSV loader instead of the crypto pipeline
+    return load_data()
 
 def load_data():
-    WEEK_FOLDER = "week5_crypto"
-    data_dir = build_week_dirs(WEEK_FOLDER)           
-    csv_path = str(Path(data_dir) / "stage_1_crypto_data.csv")
-    return getSymbolToDf(path=csv_path, threshold=100)
+    WEEK_FOLDER = "week5_funds"
+    csv_path = Path(WEEK_FOLDER) / "stage_1_fund_data.csv"
+
+    # cache paths (store in week5_funds directory)
+    pkl_path = Path(WEEK_FOLDER) / "stage_1_fund_data.pkl"
+    json_path = Path(WEEK_FOLDER) / "stage_1_fund_data.json"
+
+    def load_from_pickle(p: Path):
+        try:
+            return pd.read_pickle(p)
+        except Exception:
+            return None
+
+    def load_from_json(p: Path):
+        try:
+            import json
+            j = json.loads(p.read_text(encoding="utf-8"))
+            out = {}
+            for sym, s in j.items():
+                out[sym] = pd.read_json(s, orient="split")
+            return out
+        except Exception:
+            return None
+
+    # prefer pickle if up-to-date
+    try:
+        csv_mtime = csv_path.stat().st_mtime if csv_path.exists() else 0
+    except Exception:
+        csv_mtime = 0
+
+    if pkl_path.exists():
+        try:
+            if pkl_path.stat().st_mtime >= csv_mtime:
+                loaded = load_from_pickle(pkl_path)
+                if loaded:
+                    return loaded
+        except Exception:
+            pass
+
+    if json_path.exists():
+        try:
+            if json_path.stat().st_mtime >= csv_mtime:
+                loaded = load_from_json(json_path)
+                if loaded:
+                    return loaded
+        except Exception:
+            pass
+
+    # otherwise build from CSV via existing reader
+    symbol_to_df = getSymbolToDf(path=str(csv_path), threshold=100)
+
+    # attempt to persist caches
+    try:
+        pd.to_pickle(symbol_to_df, pkl_path)
+    except Exception:
+        pass
+    try:
+        import json
+        j = {s: df.to_json(orient="split", date_format="iso") for s, df in symbol_to_df.items()}
+        json_path.write_text(json.dumps(j), encoding="utf-8")
+    except Exception:
+        pass
+
+    return symbol_to_df
 
 def _build_price_panel(symbol_to_df: dict, symbols: List[str]) -> pd.DataFrame:
     """Return wide price panel PX[date x symbol] from symbol_to_df."""
@@ -69,6 +130,42 @@ def _pick_price_colmnmn(df: pd.DataFrame) -> Optional[str]:
             return c
     num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     return num_cols[-1] if num_cols else None
+
+
+def _pick_adj_close_col(df: pd.DataFrame) -> Optional[str]:
+    for c in ["adj_close", "Adj Close", "Adj_Close", "adj close", "adjclose", "close", "Close"]:
+        if c in df.columns:
+            return c
+    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    return num_cols[-1] if num_cols else None
+
+
+def compute_sharpe_by_symbol(symbol_to_df: dict, annual_factor: float = 252.0, risk_free: float = 0.0) -> Dict[str, float]:
+    """Compute annualized Sharpe ratio per symbol using adj_close (or fallback).
+
+    Returns dict symbol -> sharpe
+    """
+    out = {}
+    for sym, df in symbol_to_df.items():
+        try:
+            if df is None or df.empty:
+                out[sym] = float('nan'); continue
+            col = _pick_adj_close_col(df)
+            if col is None:
+                out[sym] = float('nan'); continue
+            s = pd.to_datetime(df.get('date', df.index), errors='coerce')
+            price = df[col].copy()
+            price.index = pd.to_datetime(df.get('date', df.index), errors='coerce')
+            price = price.sort_index()
+            rets = price.pct_change().dropna()
+            if rets.empty or rets.std() == 0:
+                out[sym] = float('nan'); continue
+            # excess returns (assume risk_free in same step units is approx 0)
+            sharpe = (rets.mean() - 0.0) / (rets.std() + 1e-12) * (annual_factor ** 0.5)
+            out[sym] = float(sharpe)
+        except Exception:
+            out[sym] = float('nan')
+    return out
 
 def _get_features(px: pd.Series) -> pd.DataFrame:
     r1 = px.pct_change(1)
@@ -121,6 +218,8 @@ def xsltr_Current_regime_backtest(
 
     Present_val = initial_capital
     curve = []
+    # default ridge alpha (was missing) — keep small regularization
+    ridge_alpha = 1.0
     ridge = Ridge(alpha=ridge_alpha, fit_intercept=True)
 
     start_idx = lookbck_days + buffer
@@ -387,55 +486,135 @@ def compute_curve_metrics(pf_df: pd.DataFrame) -> Tuple[float, float, float]:
 
 symbol_to_df = load_data()
 
+# ensure run_button is always defined (sidebar may be hidden on other pages)
+run_button = False
 
-# Sidebar
 
-with st.sidebar:
-    st.header("Parameters")
-    available_symbols = list(symbol_to_df.keys())
-    available_models = MODELS
-    available_features = FEATURES
+# Page selector and UI blocks
+# Keep the Momentum controls in the sidebar; Sentiment gets its own main page
+page = st.sidebar.selectbox("Page", ["Momentum Explorer", "Sentiment Analysis"]) 
 
-    symbols = st.multiselect(
-        "Select Symbols to Backtest:",
-        options=available_symbols,
-        default=available_symbols[:3],
-    )
-    st.session_state.selection_Symbols = list(symbols)
+if page == "Momentum Explorer":
+    with st.sidebar:
+        st.header("Parameters")
+        available_symbols = list(symbol_to_df.keys())
+        available_models = MODELS
+        available_features = FEATURES
 
-    selected_models = st.multiselect(
-        "Select Models to Compare:",
-        options=available_models,
-        default=["ridge", "ols", "elasticnet"],
-        format_func=lambda x: m_labels.get(x, x.replace("_", " ").title()),
-    )
-    selected_features = st.multiselect(
-        "Select Features for the Models:",
-        options=available_features,
-        default=available_features,
-        format_func=lambda x: f_labels.get(x, x.replace("_", " ").title()),
-    )
+        symbols = st.multiselect(
+            "Select Symbols to Backtest:",
+            options=available_symbols,
+            default=available_symbols[:3],
+        )
+        st.session_state.selection_Symbols = list(symbols)
 
-    train_size = st.slider("Training Data Size (in Days):", 30, 250, 120)
-    pred_horizon = st.slider("Prediction pred_horizon (in Days):", 1, 20, 5)
-    threshold = st.number_input("Prediction Threshold:", 0.0, 1.0, 0.0, step=0.01)
-    initial_capital = st.number_input("Initial Capital:", 1000, 1_000_000, 10_000, step=1000)
+        selected_models = st.multiselect(
+            "Select Models to Compare:",
+            options=available_models,
+            default=["ridge", "ols", "elasticnet"],
+            format_func=lambda x: m_labels.get(x, x.replace("_", " ").title()),
+        )
+        selected_features = st.multiselect(
+            "Select Features for the Models:",
+            options=available_features,
+            default=available_features,
+            format_func=lambda x: f_labels.get(x, x.replace("_", " ").title()),
+        )
 
-    rebalance_freq = st.selectbox(
-        "Rebalancing Frequency:",
-        ["D", "2D", "3D", "W-FRI", "M"],
-        index=0,
-        help="D = daily, 2D/3D = every 2/3 days, W-FRI = weekly on Fridays, M = month-end."
-    )
+        train_size = st.slider("Training Data Size (in Days):", 30, 250, 120)
+        pred_horizon = st.slider("Prediction pred_horizon (in Days):", 1, 20, 5)
+        threshold = st.number_input("Prediction Threshold:", 0.0, 1.0, 0.0, step=0.01)
+        initial_capital = st.number_input("Initial Capital:", 1000, 1_000_000, 10_000, step=1000)
 
-    cum_strats_to_add = st.multiselect(
-        "Add Cumulative-Returns Strategies:",
-        ["Min Variance", "Mean Variance", "Risk Parity"],
-        default=["Min Variance", "Mean Variance", "Risk Parity"]
-    )
+        rebalance_freq = st.selectbox(
+            "Rebalancing Frequency:",
+            ["D", "2D", "3D", "W-FRI", "M"],
+            index=0,
+            help="D = daily, 2D/3D = every 2/3 days, W-FRI = weekly on Fridays, M = month-end."
+        )
 
-    
-    run_button = st.button("Run Backtest & Plot")
+        cum_strats_to_add = st.multiselect(
+            "Add Cumulative-Returns Strategies:",
+            ["Min Variance", "Mean Variance", "Risk Parity"],
+            default=["Min Variance", "Mean Variance", "Risk Parity"]
+        )
+
+        run_button = st.button("Run Backtest & Plot")
+
+        st.markdown("---")
+        st.header("Data Cache & Quick Analysis")
+        cache_format = st.selectbox("Cache Save Format:", ["pickle", "json"], index=0)
+        if st.button("Refresh / Rebuild Cache"):
+            # force rebuild: remove existing cache files so load_data() will rebuild
+            week_folder = Path("week5_funds")
+            for p in [week_folder / "stage_1_fund_data.pkl", week_folder / "stage_1_fund_data.json"]:
+                try:
+                    if p.exists():
+                        p.unlink()
+                except Exception:
+                    pass
+            st.info("Cache cleared. Re-run to rebuild from CSV or downloader.")
+
+        if st.button("Compute Sharpe Ratios (Adj Close)"):
+            try:
+                sr = compute_sharpe_by_symbol(symbol_to_df)
+                sr_df = pd.Series(sr).sort_values(ascending=False).rename("Sharpe").to_frame()
+                st.dataframe(sr_df)
+            except Exception:
+                st.error("Sharpe computation failed.")
+
+
+if page == "Sentiment Analysis":
+    st.markdown("---")
+    st.header("Sentiment Analysis (News)")
+    api_key = st.text_input("News API key (optional)", value="")
+    if st.button("Run Sentiment Pipeline"):
+        with st.spinner("Fetching news & computing sentiment (this may take a while)..."):
+            try:
+                result = run_sentiment_pipeline(api_key=api_key or None)
+                st.session_state["sentiment"] = result
+                sig = result.get("signals", {})
+                st.success("Sentiment pipeline finished")
+                st.metric("Last-7 Avg (0-100)", f"{sig.get('last7_avg_pct', 0):.1f}")
+                st.metric("EMA (span=7)", f"{sig.get('ema_now', 0):.1f}")
+                ld = sig.get("latest_date")
+                if ld is not None:
+                    st.write(f"Latest data date: {pd.to_datetime(ld).date()}")
+            except Exception as e:
+                st.error(f"Sentiment pipeline failed: {e}")
+
+    # If sentiment results are cached in session state, render compact signals and visuals
+    if "sentiment" in st.session_state:
+        s = st.session_state["sentiment"].get("signals", {})
+        st.subheader("Compact Signals")
+        cols = st.columns(3)
+        cols[0].metric("Last-7 avg %", f"{s.get('last7_avg_pct', 0):.2f}%")
+        cols[1].metric("EMA now", f"{s.get('ema_now', 0):.3f}")
+        cols[2].write(f"Latest date\n{s.get('latest_date')}")
+
+        # Gauge using plotly
+        try:
+            val = float(s.get('last7_avg_pct', 50.0))
+            import plotly.graph_objects as _go
+
+            gauge = _go.Figure(_go.Indicator(
+                mode="gauge+number",
+                value=max(0, min(100, val)),
+                title={'text': "Last-7 Avg % (0-100)"},
+                gauge={'axis': {'range': [0, 100]}, 'bar': {'color': "darkblue"}}
+            ))
+            st.plotly_chart(gauge, use_container_width=True)
+        except Exception:
+            st.write("Unable to render gauge.")
+
+        # timeseries plot if available
+        try:
+            ts = s.get('timeseries')
+            if ts is not None:
+                fig_ts = px.line(ts, x='date', y='score', title='Sentiment time series')
+                st.plotly_chart(fig_ts, use_container_width=True)
+        except Exception:
+            pass
 
 def _effective_symbols_and_train_size(symbol_to_df: dict, symbols: list[str], train_size: int, pred_h: int):
     ok = []

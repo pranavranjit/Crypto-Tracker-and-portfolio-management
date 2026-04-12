@@ -1,6 +1,5 @@
 import os
 from typing import Any, Dict
-from dotenv import load_dotenv
 import google.generativeai as genai
 import streamlit as st
 import pandas as pd
@@ -13,10 +12,9 @@ st.subheader("Your AI copilot for market momentum and smart trading decisions")
 
 
 
-load_dotenv("pages/cores/.env")
-API_KEY = os.getenv("GEMINI_API_KEY")
+API_KEY = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY"))
 
-genai.configure(api_key="REDACTED")
+genai.configure(api_key=API_KEY)
 
 
 def _safe_get(d: Dict, path: str, default=None):

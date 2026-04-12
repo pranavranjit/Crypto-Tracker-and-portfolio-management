@@ -2,9 +2,12 @@ import pandas as pd
 import numpy as np
 
 
-def clean_crypto_df(df):
+def clean_fund_df(df):
     # Ensure 'date' is datetime and sorted
-    df["date"] = pd.to_datetime(df["date"])
+    if df.empty:
+        return df
+    
+    df["date"] = pd.to_datetime(df["date"], errors='coerce')
     df = df.sort_values("date").reset_index(drop=True)
 
     symbols = df["symbol"].unique()
@@ -12,6 +15,9 @@ def clean_crypto_df(df):
 
     for symbol in symbols:
         sub_df = df[df["symbol"] == symbol].copy()
+        
+        if sub_df.empty:
+            continue
 
         # Full daily date range for this symbol
         full_range = pd.DataFrame(
@@ -43,6 +49,9 @@ def clean_crypto_df(df):
 
         cleaned_list.append(merged)
 
+    if not cleaned_list:
+        return df  # Return original if no cleaned data
+    
     cleaned_df = pd.concat(cleaned_list, ignore_index=True)
     return cleaned_df
 
@@ -115,9 +124,70 @@ def add_volume_and_technical_features(df, window=14, bollinger_k=2):
     return df
 
 
+def add_lagged_return_target(df, lag: int = 1):
+    """
+    Add lagged return as prediction target for ML models.
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        DataFrame with 'return' column
+    lag : int
+        Number of periods to lag the return
+    
+    Returns:
+    --------
+    pd.DataFrame
+        DataFrame with 'return_target' column added
+    """
+    df = df.copy()
+    if "return" not in df.columns:
+        df["return"] = df["close"].pct_change()
+    df["return_target"] = df["return"].shift(-lag)
+    return df
+
+
+def get_price_column(df: pd.DataFrame) -> str:
+    """
+    Detect the appropriate price column from a DataFrame.
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        DataFrame with price data
+    
+    Returns:
+    --------
+    str
+        Name of the price column
+    
+    Raises:
+    -------
+    ValueError
+        If no price column is found
+    """
+    for col in ["close", "price", "Close", "Price", "adj_close", "Adj Close", "Adj_Close"]:
+        if col in df.columns:
+            return col
+    
+    # Fallback to last numeric column
+    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    if numeric_cols:
+        return numeric_cols[-1]
+    
+    raise ValueError("No price column found in DataFrame")
+
+
 def getSymbolToDf(path: str, threshold: int = 100):
     df = pd.read_csv(path)
-    df.date = pd.to_datetime(df.date, format="%Y-%m-%d")
+    # Parse datetime and convert to UTC, then remove timezone info for compatibility
+    df['date'] = pd.to_datetime(df['date'], errors='coerce', utc=True)
+    df['date'] = df['date'].dt.tz_localize(None)  # Remove timezone info
+    
+    # Handle column naming: rename 'ticker' to 'symbol' if necessary
+    if 'ticker' in df.columns and 'symbol' not in df.columns:
+        df = df.rename(columns={'ticker': 'symbol'})
+    
     symbol_to_df = {}
     for symbol, mini_df in df.groupby(by="symbol"):
         if len(mini_df) < threshold:
@@ -125,8 +195,13 @@ def getSymbolToDf(path: str, threshold: int = 100):
         mini_df.sort_values(by="date", inplace=True)
         mini_df = addReturns(mini_df)
         mini_df = add_ohlc_features(mini_df)
+
+        # volume handling: support both 'usd_volume' (old crypto pipeline) and 'volume' (funds/etfs)
+        if "usd_volume" not in mini_df.columns and "volume" in mini_df.columns:
+            mini_df = mini_df.rename(columns={"volume": "usd_volume"})
+
         mini_df = add_volume_and_technical_features(mini_df)
 
-        symbol_to_df[symbol] = clean_crypto_df(mini_df.reset_index(drop=True))
+        symbol_to_df[symbol] = clean_fund_df(mini_df.reset_index(drop=True))
 
     return symbol_to_df
