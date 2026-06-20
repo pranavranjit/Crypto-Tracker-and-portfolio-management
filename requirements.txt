@@ -75,5 +75,4 @@ uritemplate==4.2.0
 urllib3==2.5.0
 watchdog==6.0.0
 wordcloud==1.9.4
-cvxpy==1.6.0
 yfinance==0.2.44
