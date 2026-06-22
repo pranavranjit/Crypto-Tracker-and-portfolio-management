@@ -70,8 +70,15 @@ def fetch_news_range(
         query_day = end_dt.strftime("%Y-%m-%d")
         logging.info("Requesting articles up to %s (UTC)", query_day)
 
+        params = {"lang": lang, "to_ts": query_ts}
+        headers = {}
+        if api_key:
+            # CoinDesk's data-api accepts the key either as a query param or an
+            # Authorization header depending on plan; send both to be safe.
+            params["api_key"] = api_key
+            headers["Authorization"] = f"Apikey {api_key}"
         try:
-            resp = requests.get(f"{url}?lang={lang}&to_ts={query_ts}", timeout=30)
+            resp = requests.get(url, params=params, headers=headers, timeout=30)
         except Exception as e:
             logging.error("Request failed: %s", e)
             break
@@ -399,6 +406,80 @@ def _compute_regime_signals(df_final: pd.DataFrame) -> Dict[str, object]:
     out["latest_date"] = pd.to_datetime(daily.index.max())
     out["timeseries"] = daily.reset_index()
     return out
+
+
+def _stage1_in_memory(
+    api_key: Optional[str], start_dt: datetime, end_dt: datetime
+) -> pd.DataFrame:
+    """Pure-memory variant of stage1: download from CoinDesk, normalize columns,
+    return the DataFrame. No disk read or write."""
+    df = fetch_news_range(api_key, start_dt, end_dt)
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    drop_cols = [
+        "GUID", "PUBLISHED_ON_NS", "IMAGE_URL", "SUBTITLE", "AUTHORS", "URL", "UPVOTES",
+        "DOWNVOTES", "SCORE", "CREATED_ON", "UPDATED_ON", "SOURCE_DATA", "CATEGORY_DATA",
+        "STATUS", "SOURCE_ID", "TYPE",
+    ]
+    df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
+    df.columns = df.columns.str.lower()
+
+    if "id" not in df.columns:
+        df["id"] = np.arange(len(df))
+    other = [c for c in df.columns if c not in ["date", "id"]]
+    df = df[["date", "id"] + other]
+
+    if "sentiment" in df.columns:
+        df["positive"] = np.where(
+            df["sentiment"].astype(str).str.upper() == "POSITIVE", 1, 0
+        )
+        df = df.drop(columns="sentiment")
+    else:
+        df["positive"] = np.nan
+    return df
+
+
+def _stage3_score_only(df_clean: pd.DataFrame, *, thr: float = 0.05) -> pd.DataFrame:
+    """Pure-memory variant of stage3: VADER scoring, threshold + word filters,
+    rescale to 0-100. No plots, no CSV writes."""
+    if df_clean is None or df_clean.empty:
+        return pd.DataFrame()
+
+    df = df_clean.copy()
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df[["neg", "neu", "pos", "compound"]] = df["all_text"].apply(_vader_scores)
+
+    df_thr = df.loc[df["compound"].abs() >= thr].copy()
+    df_final = _add_word_filters(df_thr).loc[lambda d: ~d["below_p25"]].copy()
+    df_final["sentiment"] = np.where(df_final["compound"] >= thr, "positive", "negative")
+    df_final = _rescale(df_final)
+    return df_final
+
+
+def run_sentiment_pipeline_live(
+    *,
+    api_key: Optional[str] = None,
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+    thr: float = 0.05,
+) -> Dict[str, object]:
+    """End-to-end pipeline with NO disk read/write. Downloads fresh news from
+    CoinDesk, runs preprocessing + VADER, returns df_final and regime signals."""
+    if end_dt is None:
+        end_dt = datetime.utcnow()
+    if start_dt is None:
+        start_dt = end_dt - timedelta(days=365)
+
+    df_stage1 = _stage1_in_memory(api_key, start_dt, end_dt)
+    if df_stage1.empty:
+        return {"signals": _compute_regime_signals(pd.DataFrame()), "df_final": pd.DataFrame()}
+
+    df_stage2 = stage2_add_columns(df_stage1)
+    df_final = _stage3_score_only(df_stage2, thr=thr)
+    signals = _compute_regime_signals(df_final)
+    return {"signals": signals, "df_final": df_final}
 
 
 def run_sentiment_pipeline(

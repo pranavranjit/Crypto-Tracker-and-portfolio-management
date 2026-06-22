@@ -1,18 +1,25 @@
+import time
+import traceback
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
-from pathlib import Path
-from typing import Optional, Tuple, Dict, List
-import traceback
+import yfinance as yf
+
+from pages.cores.commons import FEATURES, MODELS
+from pages.cores.reader import (
+    add_ohlc_features,
+    add_volume_and_technical_features,
+    addReturns,
+    clean_fund_df,
+)
 
 # Project imports
 from pages.cores.runners import multi_symbol_rotation_by_model
-from pages.cores.reader import getSymbolToDf
-from pages.cores.commons import FEATURES, MODELS
-from pages.cores.sentiment_pipeline import run_sentiment_pipeline
-
-import plotly.graph_objects as go
-import plotly.express as px
+from pages.cores.sentiment_pipeline import run_sentiment_pipeline_live
 
 st.set_page_config(page_title="Mutual Fund Momentum Explorer", layout="wide")
 st.title("Momentum Explorer Dashboard for Mutual Funds")
@@ -28,80 +35,112 @@ f_labels = {
     "rsi": "RSI",
     "volatility": "Volatility",
     "volume_ratio": "Volume Ratio",
-    
 }
 
 
-@st.cache_data(show_spinner=False)
-def download_data():
-    # Use the mutual-fund CSV loader instead of the crypto pipeline
-    return load_data()
+DEFAULT_TICKERS = [
+    "VOO",
+    "VTI",
+    "SPY",
+    "QQQ",
+    "IWM",
+    "BND",
+    "BNDX",
+    "VEMAX",
+    "VXUS",
+    "VFIAX",
+    "VTSAX",
+    "FXAIX",
+    "VIG",
+    "VIGAX",
+    "SCHZ",
+]
+DEFAULT_START = "2010-01-01"
 
-def load_data():
-    WEEK_FOLDER = "week5_funds"
-    csv_path = Path(WEEK_FOLDER) / "stage_1_fund_data.csv"
 
-    # cache paths (store in week5_funds directory)
-    pkl_path = Path(WEEK_FOLDER) / "stage_1_fund_data.pkl"
-    json_path = Path(WEEK_FOLDER) / "stage_1_fund_data.json"
+def _build_symbol_to_df(
+    raw_frames: Dict[str, pd.DataFrame], threshold: int = 100
+) -> Dict[str, pd.DataFrame]:
+    symbol_to_df: Dict[str, pd.DataFrame] = {}
+    for symbol, df in raw_frames.items():
+        if df is None or df.empty or len(df) < threshold:
+            continue
+        mini = df.copy()
+        # Normalize to date-only (midnight) so dates align across tickers regardless
+        # of the timezone/DST offset yfinance attaches.
+        mini["date"] = (
+            pd.to_datetime(mini["date"], errors="coerce", utc=True)
+            .dt.tz_convert("UTC")
+            .dt.normalize()
+            .dt.tz_localize(None)
+        )
+        mini = mini.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+        mini["symbol"] = symbol
 
-    def load_from_pickle(p: Path):
-        try:
-            return pd.read_pickle(p)
-        except Exception:
-            return None
+        mini = addReturns(mini)
+        mini = add_ohlc_features(mini)
+        if "usd_volume" not in mini.columns and "volume" in mini.columns:
+            mini = mini.rename(columns={"volume": "usd_volume"})
+        mini = add_volume_and_technical_features(mini)
 
-    def load_from_json(p: Path):
-        try:
-            import json
-            j = json.loads(p.read_text(encoding="utf-8"))
-            out = {}
-            for sym, s in j.items():
-                out[sym] = pd.read_json(s, orient="split")
-            return out
-        except Exception:
-            return None
-
-    # prefer pickle if up-to-date
-    try:
-        csv_mtime = csv_path.stat().st_mtime if csv_path.exists() else 0
-    except Exception:
-        csv_mtime = 0
-
-    if pkl_path.exists():
-        try:
-            if pkl_path.stat().st_mtime >= csv_mtime:
-                loaded = load_from_pickle(pkl_path)
-                if loaded:
-                    return loaded
-        except Exception:
-            pass
-
-    if json_path.exists():
-        try:
-            if json_path.stat().st_mtime >= csv_mtime:
-                loaded = load_from_json(json_path)
-                if loaded:
-                    return loaded
-        except Exception:
-            pass
-
-    # otherwise build from CSV via existing reader
-    symbol_to_df = getSymbolToDf(path=str(csv_path), threshold=100)
-
-    # attempt to persist caches
-    try:
-        pd.to_pickle(symbol_to_df, pkl_path)
-    except Exception:
-        pass
-    try:
-        import json
-        j = {s: df.to_json(orient="split", date_format="iso") for s, df in symbol_to_df.items()}
-        json_path.write_text(json.dumps(j), encoding="utf-8")
-    except Exception:
-        pass
-
+        cleaned = clean_fund_df(mini.reset_index(drop=True))
+        # Drop tickers whose feature pipeline killed every row (e.g. mutual
+        # funds with no volume data on yfinance).
+        if cleaned is None or cleaned.empty or len(cleaned) < threshold:
+            continue
+        symbol_to_df[symbol] = cleaned
     return symbol_to_df
+
+
+@st.cache_data(show_spinner=True, ttl=60 * 60)
+def load_data(
+    tickers: Tuple[str, ...] = tuple(DEFAULT_TICKERS), start: str = DEFAULT_START
+) -> Dict[str, pd.DataFrame]:
+    """Download OHLCV data live from yfinance and build the symbol_to_df dict.
+
+    No on-disk caching — Streamlit's in-process cache is the only cache.
+    """
+    raw_frames: Dict[str, pd.DataFrame] = {}
+    for t in tickers:
+        # Yahoo frequently rate-limits shared cloud IPs; retry a few times
+        # with a short backoff before giving up on a ticker.
+        hist = None
+        for attempt in range(3):
+            try:
+                hist = yf.Ticker(t).history(
+                    start=start, auto_adjust=True, actions=False
+                )
+                if hist is not None and not hist.empty:
+                    break
+            except Exception:
+                hist = None
+            time.sleep(0.5 * (attempt + 1))
+        if hist is None or hist.empty:
+            continue
+        hist = hist.reset_index().rename(
+            columns={
+                "Date": "date",
+                "Datetime": "date",
+                "index": "date",
+                "Open": "open",
+                "High": "high",
+                "Low": "low",
+                "Close": "close",
+                "Volume": "volume",
+                "Adj Close": "adj_close",
+            }
+        )
+        raw_frames[t] = hist
+
+    if not raw_frames:
+        raise RuntimeError(
+            "Could not download any market data from Yahoo Finance. This is "
+            "usually a temporary rate-limit on the server's IP — wait a minute "
+            "and click 'Refresh Live Data', or try again shortly."
+        )
+
+    return _build_symbol_to_df(raw_frames, threshold=100)
+
 
 def _build_price_panel(symbol_to_df: dict, symbols: List[str]) -> pd.DataFrame:
     """Return wide price panel PX[date x symbol] from symbol_to_df."""
@@ -133,14 +172,24 @@ def _pick_price_colmnmn(df: pd.DataFrame) -> Optional[str]:
 
 
 def _pick_adj_close_col(df: pd.DataFrame) -> Optional[str]:
-    for c in ["adj_close", "Adj Close", "Adj_Close", "adj close", "adjclose", "close", "Close"]:
+    for c in [
+        "adj_close",
+        "Adj Close",
+        "Adj_Close",
+        "adj close",
+        "adjclose",
+        "close",
+        "Close",
+    ]:
         if c in df.columns:
             return c
     num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     return num_cols[-1] if num_cols else None
 
 
-def compute_sharpe_by_symbol(symbol_to_df: dict, annual_factor: float = 252.0, risk_free: float = 0.0) -> Dict[str, float]:
+def compute_sharpe_by_symbol(
+    symbol_to_df: dict, annual_factor: float = 252.0, risk_free: float = 0.0
+) -> Dict[str, float]:
     """Compute annualized Sharpe ratio per symbol using adj_close (or fallback).
 
     Returns dict symbol -> sharpe
@@ -149,23 +198,27 @@ def compute_sharpe_by_symbol(symbol_to_df: dict, annual_factor: float = 252.0, r
     for sym, df in symbol_to_df.items():
         try:
             if df is None or df.empty:
-                out[sym] = float('nan'); continue
+                out[sym] = float("nan")
+                continue
             col = _pick_adj_close_col(df)
             if col is None:
-                out[sym] = float('nan'); continue
-            s = pd.to_datetime(df.get('date', df.index), errors='coerce')
+                out[sym] = float("nan")
+                continue
+            s = pd.to_datetime(df.get("date", df.index), errors="coerce")
             price = df[col].copy()
-            price.index = pd.to_datetime(df.get('date', df.index), errors='coerce')
+            price.index = pd.to_datetime(df.get("date", df.index), errors="coerce")
             price = price.sort_index()
             rets = price.pct_change().dropna()
             if rets.empty or rets.std() == 0:
-                out[sym] = float('nan'); continue
+                out[sym] = float("nan")
+                continue
             # excess returns (assume risk_free in same step units is approx 0)
-            sharpe = (rets.mean() - 0.0) / (rets.std() + 1e-12) * (annual_factor ** 0.5)
+            sharpe = (rets.mean() - 0.0) / (rets.std() + 1e-12) * (annual_factor**0.5)
             out[sym] = float(sharpe)
         except Exception:
-            out[sym] = float('nan')
+            out[sym] = float("nan")
     return out
+
 
 def _get_features(px: pd.Series) -> pd.DataFrame:
     r1 = px.pct_change(1)
@@ -174,32 +227,46 @@ def _get_features(px: pd.Series) -> pd.DataFrame:
     r20 = px.pct_change(20)
     vol20 = r1.rolling(20).std()
     mom20 = px.pct_change(20)
-    return pd.DataFrame({"r1": r1, "r5": r5, "r10": r10, "r20": r20, "vol20": vol20, "mom20": mom20})
+    return pd.DataFrame(
+        {"r1": r1, "r5": r5, "r10": r10, "r20": r20, "vol20": vol20, "mom20": mom20}
+    )
+
 
 def _cs_zscore(df_xs: pd.DataFrame) -> pd.DataFrame:
     return (df_xs - df_xs.mean()) / (df_xs.std(ddof=0) + 1e-9)
 
+
 def _sentiment_Current_regime_from_session(ss) -> str:
-    sig = ss.get("sentiment", {}).get("signals", {}) if isinstance(ss.get("sentiment", {}), dict) else {}
-    last7 = sig.get("last7_avg_pct"); ema = sig.get("ema_now")
-    if last7 is None: return "neutral"
-    if last7 < 45 or (ema is not None and ema < 50): return "fear"
-    if last7 > 75: return "extreme_greed"
-    if last7 > 55: return "greed"
+    sig = (
+        ss.get("sentiment", {}).get("signals", {})
+        if isinstance(ss.get("sentiment", {}), dict)
+        else {}
+    )
+    last7 = sig.get("last7_avg_pct")
+    ema = sig.get("ema_now")
+    if last7 is None:
+        return "neutral"
+    if last7 < 45 or (ema is not None and ema < 50):
+        return "fear"
+    if last7 > 75:
+        return "extreme_greed"
+    if last7 > 55:
+        return "greed"
     return "neutral"
+
 
 def xsltr_Current_regime_backtest(
     symbol_to_df: dict,
     symbols: list[str],
     pred_horizon: int = 5,
     initial_capital: float = 10_000.0,
-    rebalance_days: int = 5,                 
-    rebalance_freq: Optional[str] = None,    
+    rebalance_days: int = 5,
+    rebalance_freq: Optional[str] = None,
     lookbck_days: int = 120,
     buffer: int = 40,
     session_state=None,
 ) -> pd.DataFrame:
-   
+
     from sklearn.linear_model import Ridge
 
     PX = _build_price_panel(symbol_to_df, symbols)
@@ -207,10 +274,14 @@ def xsltr_Current_regime_backtest(
     F = pd.concat({sym: feat[sym] for sym in PX.columns}, axis=1)
 
     Current_regime = _sentiment_Current_regime_from_session(session_state or {})
-    if Current_regime == "fear":               topk, exposure = 1, 0.4
-    elif Current_regime == "greed":            topk, exposure = 5, 1.0
-    elif Current_regime == "extreme_greed":    topk, exposure = 6, 1.0
-    else:                              topk, exposure = 3, 0.7
+    if Current_regime == "fear":
+        topk, exposure = 1, 0.4
+    elif Current_regime == "greed":
+        topk, exposure = 5, 1.0
+    elif Current_regime == "extreme_greed":
+        topk, exposure = 6, 1.0
+    else:
+        topk, exposure = 3, 0.7
 
     dates = PX.index.to_list()
     if len(PX) < (lookbck_days + buffer + pred_horizon + 2):
@@ -255,20 +326,27 @@ def xsltr_Current_regime_backtest(
                 rowv = row_all.loc[d][["r1", "r5", "r10", "r20", "vol20", "mom20"]]
                 if rowv.isna().any():
                     continue
-                xs_rows.append(rowv.values.astype(float)); syms_ok.append(sym)
+                xs_rows.append(rowv.values.astype(float))
+                syms_ok.append(sym)
 
             if len(xs_rows) < 3:
                 continue
 
-            Xd = pd.DataFrame(xs_rows, index=syms_ok, columns=["r1", "r5", "r10", "r20", "vol20", "mom20"])
+            Xd = pd.DataFrame(
+                xs_rows,
+                index=syms_ok,
+                columns=["r1", "r5", "r10", "r20", "vol20", "mom20"],
+            )
             Xd = _cs_zscore(Xd)
 
             keep, yvals = [], []
             for sym in Xd.index:
-                p0 = PX.loc[d, sym]; p1 = PX.loc[d1, sym]
+                p0 = PX.loc[d, sym]
+                p1 = PX.loc[d1, sym]
                 r = p1 / p0 - 1.0
                 if np.isfinite(r):
-                    keep.append(sym); yvals.append(r)
+                    keep.append(sym)
+                    yvals.append(r)
             if len(keep) < 3:
                 continue
 
@@ -277,13 +355,17 @@ def xsltr_Current_regime_backtest(
             rows_y.append(np.array(yvals))
 
         if not rows_X:
-            curve.append((t1, Present_val)); continue
+            curve.append((t1, Present_val))
+            continue
 
-        X_train = np.vstack(rows_X); y_train = np.concatenate(rows_y)
+        X_train = np.vstack(rows_X)
+        y_train = np.concatenate(rows_y)
         mask = np.isfinite(X_train).all(axis=1) & np.isfinite(y_train)
-        X_train = X_train[mask]; y_train = y_train[mask]
+        X_train = X_train[mask]
+        y_train = y_train[mask]
         if len(X_train) < 30:
-            curve.append((t1, Present_val)); continue
+            curve.append((t1, Present_val))
+            continue
 
         ridge.fit(X_train, y_train)
 
@@ -299,7 +381,8 @@ def xsltr_Current_regime_backtest(
             feat_rows[sym] = row.values.astype(float)
 
         if len(feat_rows) < 3:
-            curve.append((t1, Present_val)); continue
+            curve.append((t1, Present_val))
+            continue
 
         X0 = pd.DataFrame(feat_rows).T
         X0.columns = ["r1", "r5", "r10", "r20", "vol20", "mom20"]
@@ -309,26 +392,32 @@ def xsltr_Current_regime_backtest(
         rank = pd.Series(scores, index=X0.index).sort_values(ascending=False)
         k = min(topk, len(rank))
         if k == 0:
-            curve.append((t1, Present_val)); continue
+            curve.append((t1, Present_val))
+            continue
         picks = list(rank.index[:k])
 
         # realising equal-weight period return
         rets = []
         for sym in picks:
-            p0 = PX.loc[t0, sym]; p1 = PX.loc[t1, sym]
+            p0 = PX.loc[t0, sym]
+            p1 = PX.loc[t1, sym]
             r = p1 / p0 - 1.0
-            if np.isfinite(r): rets.append(r)
+            if np.isfinite(r):
+                rets.append(r)
         if not rets:
-            curve.append((t1, Present_val)); continue
+            curve.append((t1, Present_val))
+            continue
 
-        Present_val *= (1.0 + float(np.mean(rets)))
+        Present_val *= 1.0 + float(np.mean(rets))
         curve.append((t1, Present_val))
 
     out = pd.DataFrame(curve, columns=["date", "portfolio_value"]).dropna()
     return out
 
 
-def _rebalance_indices_for_panel(PX: pd.DataFrame, lookbck_days: int, rebalance_freq: str) -> List[int]:
+def _rebalance_indices_for_panel(
+    PX: pd.DataFrame, lookbck_days: int, rebalance_freq: str
+) -> List[int]:
     dates = PX.index.to_list()
     start_idx = lookbck_days
     end_idx = len(dates) - 1
@@ -337,8 +426,10 @@ def _rebalance_indices_for_panel(PX: pd.DataFrame, lookbck_days: int, rebalance_
     rebal_indices = [PX.index.get_loc(d) for d in rebal_dates]
     return [i for i in rebal_indices if i < end_idx]
 
+
 def _safe_pinv(mat: np.ndarray) -> np.ndarray:
     return np.linalg.pinv(mat + 1e-10 * np.eye(mat.shape[0]))
+
 
 def _weights_MinVar(Sigma: np.ndarray, enforce_nonneg: bool = True) -> np.ndarray:
     n = Sigma.shape[0]
@@ -356,7 +447,10 @@ def _weights_MinVar(Sigma: np.ndarray, enforce_nonneg: bool = True) -> np.ndarra
         w = (w / s) if s > 0 else np.ones(n) / n
     return w
 
-def _weights_meanvar(Sigma: np.ndarray, mu: np.ndarray, enforce_nonneg: bool = True, cap: float = 0.5) -> np.ndarray:
+
+def _weights_meanvar(
+    Sigma: np.ndarray, mu: np.ndarray, enforce_nonneg: bool = True, cap: float = 0.5
+) -> np.ndarray:
     invS = _safe_pinv(Sigma)
     w = invS @ mu
     w = np.maximum(w, 0) if enforce_nonneg else w
@@ -366,10 +460,12 @@ def _weights_meanvar(Sigma: np.ndarray, mu: np.ndarray, enforce_nonneg: bool = T
     w = (w / s) if s > 0 else np.ones_like(w) / len(w)
     return w
 
+
 def _weights_risk_parity(vol: np.ndarray) -> np.ndarray:
     inv_vol = 1.0 / np.maximum(vol, 1e-12)
     w = inv_vol / inv_vol.sum()
     return w
+
 
 def _cumret_backtest(
     symbol_to_df: dict,
@@ -377,15 +473,17 @@ def _cumret_backtest(
     initial_capital: float,
     rebalance_freq: str,
     lookbck_days: int,
-    method: str,  
+    method: str,
 ) -> pd.DataFrame:
-    
+
     PX = _build_price_panel(symbol_to_df, symbols)
     ret = PX.pct_change().dropna()
 
     idxs = _rebalance_indices_for_panel(PX, lookbck_days, rebalance_freq)
     if not idxs:
-        raise ValueError("No rebalancing points available. Try shorter frequency or longer history.")
+        raise ValueError(
+            "No rebalancing points available. Try shorter frequency or longer history."
+        )
 
     Present_val = initial_capital
     curve = []
@@ -400,9 +498,10 @@ def _cumret_backtest(
         if t1_idx <= t_idx:
             continue
 
-        window = ret.iloc[max(0, t_idx - lookbck_days): t_idx]
+        window = ret.iloc[max(0, t_idx - lookbck_days) : t_idx]
         if window.shape[0] < max(20, lookbck_days // 4):
-            curve.append((t1, Present_val)); continue
+            curve.append((t1, Present_val))
+            continue
 
         mu = window.mean().values
         Sigma = np.cov(window.values.T)
@@ -419,30 +518,30 @@ def _cumret_backtest(
 
         p0 = PX.iloc[t_idx].values
         p1 = PX.iloc[t1_idx].values
-        period_ret = (p1 / p0 - 1.0)
+        period_ret = p1 / p0 - 1.0
         period_ret = np.where(np.isfinite(period_ret), period_ret, 0.0)
         port_r = float(np.dot(w, period_ret))
-        Present_val *= (1.0 + port_r)
+        Present_val *= 1.0 + port_r
         curve.append((t1, Present_val))
 
     return pd.DataFrame(curve, columns=["date", "portfolio_value"]).dropna()
 
 
-def _annualize_factor_from_index(idx: pd.DatetimeIndex) -> float:
-    
+def _annualize_factor_from_index(idx: pd.DatetimeIndex) -> Tuple[float, float]:
     if len(idx) < 2:
-        return np.nan
+        return (float("nan"), float("nan"))
     gaps = np.diff(idx.values).astype("timedelta64[D]").astype(int)
     step_days = int(np.median(gaps)) if len(gaps) else 1
     step_days = max(step_days, 1)
     annual_steps = 252 / step_days
     return float(np.sqrt(annual_steps)), float(step_days)
 
+
 def compute_curve_metrics(pf_df: pd.DataFrame) -> Tuple[float, float, float]:
-    
-    MIN_STEPS_FOR_SHARPE = 5           
-    MIN_DAYS_FOR_CAGR = 90             
-    MIN_POINTS_FOR_MDD = 3              
+
+    MIN_STEPS_FOR_SHARPE = 5
+    MIN_DAYS_FOR_CAGR = 90
+    MIN_POINTS_FOR_MDD = 3
 
     if pf_df is None or pf_df.empty or "date" not in pf_df.columns:
         return (np.nan, np.nan, np.nan)
@@ -470,7 +569,9 @@ def compute_curve_metrics(pf_df: pd.DataFrame) -> Tuple[float, float, float]:
     # CAGR
     total_days = (Present_val.index[-1] - Present_val.index[0]).days
     if total_days >= MIN_DAYS_FOR_CAGR and Present_val.iloc[0] > 0:
-        cagr = (Present_val.iloc[-1] / Present_val.iloc[0]) ** (365.25 / total_days) - 1.0
+        cagr = (Present_val.iloc[-1] / Present_val.iloc[0]) ** (
+            365.25 / total_days
+        ) - 1.0
     else:
         cagr = np.nan
 
@@ -484,7 +585,12 @@ def compute_curve_metrics(pf_df: pd.DataFrame) -> Tuple[float, float, float]:
 
     return (float(sharpe), float(cagr), mdd)
 
-symbol_to_df = load_data()
+
+try:
+    symbol_to_df = load_data()
+except Exception as _e:
+    st.error(f"Failed to download market data: {_e}")
+    st.stop()
 
 # ensure run_button is always defined (sidebar may be hidden on other pages)
 run_button = False
@@ -492,7 +598,7 @@ run_button = False
 
 # Page selector and UI blocks
 # Keep the Momentum controls in the sidebar; Sentiment gets its own main page
-page = st.sidebar.selectbox("Page", ["Momentum Explorer", "Sentiment Analysis"]) 
+page = st.sidebar.selectbox("Page", ["Momentum Explorer", "Sentiment Analysis"])
 
 if page == "Momentum Explorer":
     with st.sidebar:
@@ -524,41 +630,41 @@ if page == "Momentum Explorer":
         train_size = st.slider("Training Data Size (in Days):", 30, 250, 120)
         pred_horizon = st.slider("Prediction pred_horizon (in Days):", 1, 20, 5)
         threshold = st.number_input("Prediction Threshold:", 0.0, 1.0, 0.0, step=0.01)
-        initial_capital = st.number_input("Initial Capital:", 1000, 1_000_000, 10_000, step=1000)
+        initial_capital = st.number_input(
+            "Initial Capital:", 1000, 1_000_000, 10_000, step=1000
+        )
 
         rebalance_freq = st.selectbox(
             "Rebalancing Frequency:",
-            ["D", "2D", "3D", "W-FRI", "M"],
+            ["D", "2D", "3D", "W-FRI", "ME"],
             index=0,
-            help="D = daily, 2D/3D = every 2/3 days, W-FRI = weekly on Fridays, M = month-end."
+            help="D = daily, 2D/3D = every 2/3 days, W-FRI = weekly on Fridays, ME = month-end.",
         )
 
         cum_strats_to_add = st.multiselect(
             "Add Cumulative-Returns Strategies:",
             ["Min Variance", "Mean Variance", "Risk Parity"],
-            default=["Min Variance", "Mean Variance", "Risk Parity"]
+            default=["Min Variance", "Mean Variance", "Risk Parity"],
         )
 
         run_button = st.button("Run Backtest & Plot")
 
         st.markdown("---")
-        st.header("Data Cache & Quick Analysis")
-        cache_format = st.selectbox("Cache Save Format:", ["pickle", "json"], index=0)
-        if st.button("Refresh / Rebuild Cache"):
-            # force rebuild: remove existing cache files so load_data() will rebuild
-            week_folder = Path("week5_funds")
-            for p in [week_folder / "stage_1_fund_data.pkl", week_folder / "stage_1_fund_data.json"]:
-                try:
-                    if p.exists():
-                        p.unlink()
-                except Exception:
-                    pass
-            st.info("Cache cleared. Re-run to rebuild from CSV or downloader.")
+        st.header("Data & Quick Analysis")
+        if st.button("Refresh Live Data"):
+            load_data.clear()
+            st.success("Cache cleared. Re-running to pull fresh data from yfinance...")
+            st.rerun()
 
         if st.button("Compute Sharpe Ratios (Adj Close)"):
             try:
                 sr = compute_sharpe_by_symbol(symbol_to_df)
-                sr_df = pd.Series(sr).sort_values(ascending=False).rename("Sharpe").to_frame()
+                sr_df = (
+                    pd.Series(sr)
+                    .sort_values(ascending=False)
+                    .rename("Sharpe")
+                    .to_frame()
+                )
                 st.dataframe(sr_df)
             except Exception:
                 st.error("Sharpe computation failed.")
@@ -569,9 +675,11 @@ if page == "Sentiment Analysis":
     st.header("Sentiment Analysis (News)")
     api_key = st.text_input("News API key (optional)", value="")
     if st.button("Run Sentiment Pipeline"):
-        with st.spinner("Fetching news & computing sentiment (this may take a while)..."):
+        with st.spinner(
+            "Fetching news & computing sentiment (this may take a while)..."
+        ):
             try:
-                result = run_sentiment_pipeline(api_key=api_key or None)
+                result = run_sentiment_pipeline_live(api_key=api_key or None)
                 st.session_state["sentiment"] = result
                 sig = result.get("signals", {})
                 st.success("Sentiment pipeline finished")
@@ -594,29 +702,34 @@ if page == "Sentiment Analysis":
 
         # Gauge using plotly
         try:
-            val = float(s.get('last7_avg_pct', 50.0))
+            val = float(s.get("last7_avg_pct", 50.0))
             import plotly.graph_objects as _go
 
-            gauge = _go.Figure(_go.Indicator(
-                mode="gauge+number",
-                value=max(0, min(100, val)),
-                title={'text': "Last-7 Avg % (0-100)"},
-                gauge={'axis': {'range': [0, 100]}, 'bar': {'color': "darkblue"}}
-            ))
+            gauge = _go.Figure(
+                _go.Indicator(
+                    mode="gauge+number",
+                    value=max(0, min(100, val)),
+                    title={"text": "Last-7 Avg % (0-100)"},
+                    gauge={"axis": {"range": [0, 100]}, "bar": {"color": "darkblue"}},
+                )
+            )
             st.plotly_chart(gauge, use_container_width=True)
         except Exception:
             st.write("Unable to render gauge.")
 
         # timeseries plot if available
         try:
-            ts = s.get('timeseries')
+            ts = s.get("timeseries")
             if ts is not None:
-                fig_ts = px.line(ts, x='date', y='score', title='Sentiment time series')
+                fig_ts = px.line(ts, x="date", y="score", title="Sentiment time series")
                 st.plotly_chart(fig_ts, use_container_width=True)
         except Exception:
             pass
 
-def _effective_symbols_and_train_size(symbol_to_df: dict, symbols: list[str], train_size: int, pred_h: int):
+
+def _effective_symbols_and_train_size(
+    symbol_to_df: dict, symbols: list[str], train_size: int, pred_h: int
+):
     ok = []
     min_len = 10**9
     for s in symbols:
@@ -634,7 +747,17 @@ def _effective_symbols_and_train_size(symbol_to_df: dict, symbols: list[str], tr
     eff_train = int(min(train_size, max_train))
     return ok, eff_train
 
-def _safe_core_backtest(symbol_to_df: dict, symbols: list[str], model_list, features, train_size: int, pred_horizon: int, threshold: float, initial_capital: float):
+
+def _safe_core_backtest(
+    symbol_to_df: dict,
+    symbols: list[str],
+    model_list,
+    features,
+    train_size: int,
+    pred_horizon: int,
+    threshold: float,
+    initial_capital: float,
+):
     portfolio_outputs = {}
     sharpe_ratio = {}
     try:
@@ -669,8 +792,11 @@ def _safe_core_backtest(symbol_to_df: dict, symbols: list[str], model_list, feat
             except Exception as ee:
                 st.warning(f"Skipped model '{m}': {ee}")
         if not portfolio_outputs:
-            raise ValueError("All selected models failed to produce predictions (check features/train size).")
+            raise ValueError(
+                "All selected models failed to produce predictions (check features/train size)."
+            )
         return portfolio_outputs, sharpe_ratio
+
 
 if run_button:
     if not symbols or not selected_models or not selected_features:
@@ -679,63 +805,77 @@ if run_button:
         st.subheader("Backtest Results")
 
         try:
-            
             symbols, eff_train_size = _effective_symbols_and_train_size(
                 symbol_to_df, symbols, train_size, pred_horizon
             )
             if not symbols:
-                st.error("No symbols have enough history for the chosen pred_horizon. Pick others or reduce the pred_horizon.")
+                st.error(
+                    "No symbols have enough history for the chosen pred_horizon. Pick others or reduce the pred_horizon."
+                )
                 st.stop()
 
-            
             try:
                 portfolio_outputs, sharpe_ratio = _safe_core_backtest(
-                    symbol_to_df, symbols, selected_models, selected_features,
-                    eff_train_size, pred_horizon, threshold, initial_capital
+                    symbol_to_df,
+                    symbols,
+                    selected_models,
+                    selected_features,
+                    eff_train_size,
+                    pred_horizon,
+                    threshold,
+                    initial_capital,
                 )
             except Exception:
                 st.error("Core backtest failed.")
                 st.code(traceback.format_exc())
                 raise
 
-            
-            
-
-            
             try:
                 if "Min Variance" in cum_strats_to_add:
                     mv_curve = _cumret_backtest(
-                        symbol_to_df, symbols, initial_capital,
-                        rebalance_freq, eff_train_size, method="MinVar"
+                        symbol_to_df,
+                        symbols,
+                        initial_capital,
+                        rebalance_freq,
+                        eff_train_size,
+                        method="MinVar",
                     )
                     portfolio_outputs["Min Variance"] = mv_curve
                 if "Mean Variance" in cum_strats_to_add:
                     meanv_curve = _cumret_backtest(
-                        symbol_to_df, symbols, initial_capital,
-                        rebalance_freq, eff_train_size, method="meanvar"
+                        symbol_to_df,
+                        symbols,
+                        initial_capital,
+                        rebalance_freq,
+                        eff_train_size,
+                        method="meanvar",
                     )
                     portfolio_outputs["Mean Variance"] = meanv_curve
                 if "Risk Parity" in cum_strats_to_add:
                     rp_curve = _cumret_backtest(
-                        symbol_to_df, symbols, initial_capital,
-                        rebalance_freq, eff_train_size, method="riskparity"
+                        symbol_to_df,
+                        symbols,
+                        initial_capital,
+                        rebalance_freq,
+                        eff_train_size,
+                        method="riskparity",
                     )
                     portfolio_outputs["Risk Parity"] = rp_curve
             except Exception as e:
                 st.warning(f"Cumulative strategy failed: {e}")
 
-            
             metrics: Dict[str, Dict[str, float]] = {}
             for model_name, pf_df in portfolio_outputs.items():
                 sh, cg, mdd = compute_curve_metrics(pf_df)
                 metrics[model_name] = {
                     "Sharpe Ratio": float(sh) if np.isfinite(sh) else np.nan,
                     "CAGR (%)": float(cg * 100.0) if np.isfinite(cg) else np.nan,
-                    "Max Drawdown (%)": float(mdd * 100.0) if np.isfinite(mdd) else np.nan,
+                    "Max Drawdown (%)": float(mdd * 100.0)
+                    if np.isfinite(mdd)
+                    else np.nan,
                 }
                 sharpe_ratio[model_name] = metrics[model_name]["Sharpe Ratio"]
 
-            
             st.session_state["momentum"] = {
                 "portfolio_outputs": portfolio_outputs,
                 "metrics": metrics,
@@ -753,7 +893,6 @@ if run_button:
                 },
             }
 
-            
             st.subheader("Model outputs — Ridge, OLS, ElasticNet")
             fig_models = go.Figure()
             desired_models = {"ridge", "ols", "elasticnet"}
@@ -772,7 +911,8 @@ if run_button:
                 pretty_label = m_labels.get(lname, name.replace("_", " ").title())
                 fig_models.add_trace(
                     go.Scattergl(
-                        x=df_plot["date"], y=df_plot["portfolio_value"],
+                        x=df_plot["date"],
+                        y=df_plot["portfolio_value"],
                         mode="lines",
                         name=f"{pretty_label} (Sharpe={sh:.2f})",  # <-- R/O/E capitalized
                         hovertemplate="<b>%{fullData.name}</b><br>Date=%{x|%Y-%m-%d}<br>Value=%{y:.2f}<extra></extra>",
@@ -792,7 +932,6 @@ if run_button:
                 fig_models.update_yaxes(type="log")
                 st.plotly_chart(fig_models, use_container_width=True)
 
-            
             st.subheader("Portfolio outputs — Min Variance, Mean Variance, Risk Parity")
             fig_ports = go.Figure()
             for strat_name in ["Min Variance", "Mean Variance", "Risk Parity"]:
@@ -809,7 +948,8 @@ if run_button:
                 sh = metrics.get(strat_name, {}).get("Sharpe Ratio", np.nan)
                 fig_ports.add_trace(
                     go.Scattergl(
-                        x=df_plot["date"], y=df_plot["portfolio_value"],
+                        x=df_plot["date"],
+                        y=df_plot["portfolio_value"],
                         mode="lines",
                         name=f"{strat_name} (Sharpe={sh:.2f})",
                         hovertemplate="<b>%{fullData.name}</b><br>Date=%{x|%Y-%m-%d}<br>Value=%{y:.2f}<extra></extra>",
@@ -829,30 +969,36 @@ if run_button:
                 fig_ports.update_yaxes(type="log")
                 st.plotly_chart(fig_ports, use_container_width=True)
 
-            
             st.subheader("Performance Metrics")
             if st.session_state["momentum"]["metrics"]:
-                metrics_df = pd.DataFrame(st.session_state["momentum"]["metrics"]).T[
-                    ["Sharpe Ratio", "CAGR (%)", "Max Drawdown (%)"]
-                ].replace([np.inf, -np.inf], np.nan) \
-                 .sort_values(by="Sharpe Ratio", ascending=False)
+                metrics_df = (
+                    pd.DataFrame(st.session_state["momentum"]["metrics"])
+                    .T[["Sharpe Ratio", "CAGR (%)", "Max Drawdown (%)"]]
+                    .replace([np.inf, -np.inf], np.nan)
+                    .sort_values(by="Sharpe Ratio", ascending=False)
+                )
 
                 st.dataframe(
-                    metrics_df.style.format({
-                        "Sharpe Ratio": lambda v: "—" if pd.isna(v) else f"{v:.2f}",
-                        "CAGR (%)": lambda v: "—" if pd.isna(v) else f"{v:.2f}",
-                        "Max Drawdown (%)": lambda v: "—" if pd.isna(v) else f"{v:.2f}",
-                    })
+                    metrics_df.style.format(
+                        {
+                            "Sharpe Ratio": lambda v: "—" if pd.isna(v) else f"{v:.2f}",
+                            "CAGR (%)": lambda v: "—" if pd.isna(v) else f"{v:.2f}",
+                            "Max Drawdown (%)": lambda v: (
+                                "—" if pd.isna(v) else f"{v:.2f}"
+                            ),
+                        }
+                    )
                 )
                 if "metrics_df" not in st.session_state:
                     st.session_state.metrics_df = metrics_df
             else:
                 st.info("No metrics computed.")
 
-            
             st.subheader("Monthly Returns Heatmap (%)")
             monthly_returns_data = {}
-            for model_name, pf_df in st.session_state["momentum"]["portfolio_outputs"].items():
+            for model_name, pf_df in st.session_state["momentum"][
+                "portfolio_outputs"
+            ].items():
                 if pf_df is None or len(pf_df) <= 30:
                     continue
                 pf_df = pf_df.copy()
@@ -863,7 +1009,9 @@ if run_button:
                 pf_df["date"] = pd.to_datetime(pf_df["date"])
                 if pf_df.empty:
                     continue
-                monthly_pf = pf_df.set_index("date").resample("M")["portfolio_value"].last()
+                monthly_pf = (
+                    pf_df.set_index("date").resample("ME")["portfolio_value"].last()
+                )
                 mr = monthly_pf.pct_change() * 100
                 if not mr.empty:
                     monthly_returns_data[model_name] = mr
@@ -883,7 +1031,11 @@ if run_button:
 
                 heatmap = go.Figure(
                     data=go.Heatmap(
-                        z=z, x=x, y=y, colorscale="RdYlGn", zmid=0,
+                        z=z,
+                        x=x,
+                        y=y,
+                        colorscale="RdYlGn",
+                        zmid=0,
                         colorbar=dict(title="%"),
                         hovertemplate="Model/Strategy=%{y}<br>Date=%{x}<br>Return=%{z:.2f}%<extra></extra>",
                         zauto=False,
@@ -893,7 +1045,8 @@ if run_button:
                     title="Monthly Returns (%)",
                     xaxis_title="Date",
                     yaxis_title="Model/Strategy",
-                    height=height_px, margin=dict(l=60, r=20, t=60, b=60),
+                    height=height_px,
+                    margin=dict(l=60, r=20, t=60, b=60),
                 )
                 st.plotly_chart(heatmap, use_container_width=True)
             else:

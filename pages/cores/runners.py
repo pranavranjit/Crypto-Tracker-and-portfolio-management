@@ -23,7 +23,25 @@ def multi_symbol_rotation_by_model(
 
     # Step 1: Get predictions for each symbol and model
     for sym in symbols:
-        df = symbol_to_df[sym]
+        df = symbol_to_df.get(sym)
+        if df is None or df.empty:
+            continue
+        # Make sure the columns the rotation logic relies on exist. A 'date'
+        # column may instead be sitting in the index (e.g. after set_index),
+        # and 'return' may be missing for degenerate data — recover/skip
+        # rather than blowing up with a raw KeyError.
+        df = df.copy()
+        if "date" not in df.columns:
+            if df.index.name == "date" or isinstance(df.index, pd.DatetimeIndex):
+                df = df.reset_index().rename(columns={df.index.name or "index": "date"})
+            else:
+                continue
+        if "return" not in df.columns:
+            if "close" in df.columns:
+                df["return"] = df["close"].pct_change()
+            else:
+                continue
+
         preds_dict = getModelToPreds(
             df=df,
             models=model_name_list,
@@ -32,6 +50,8 @@ def multi_symbol_rotation_by_model(
             features=features,
         )
         for model_name, preds in preds_dict.items():
+            if preds is None or len(preds) == 0:
+                continue
             pred_df = df.iloc[-len(preds) :].copy()
             pred_df["pred"] = preds
             model_symbol_preds[model_name][sym] = pred_df[["date", "return", "pred"]]
@@ -41,6 +61,9 @@ def multi_symbol_rotation_by_model(
 
     # Step 2: For each model, build combined DataFrame of all symbols' preds
     for model_name, sym_data in model_symbol_preds.items():
+        if not sym_data:
+            # No symbol produced usable predictions for this model.
+            continue
         all_preds_df = pd.concat(
             [df.assign(symbol=sym).set_index("date") for sym, df in sym_data.items()]
         )
