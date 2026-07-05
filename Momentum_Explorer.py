@@ -10,6 +10,7 @@ import streamlit as st
 import yfinance as yf
 
 from pages.cores.commons import FEATURES, MODELS
+from pages.cores.yf_session import YF_SESSION
 from pages.cores.reader import (
     add_ohlc_features,
     add_volume_and_technical_features,
@@ -107,7 +108,7 @@ def load_data(
         hist = None
         for attempt in range(3):
             try:
-                hist = yf.Ticker(t).history(
+                hist = yf.Ticker(t, session=YF_SESSION).history(
                     start=start, auto_adjust=True, actions=False
                 )
                 if hist is not None and not hist.empty:

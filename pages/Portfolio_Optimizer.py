@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Tuple
 
 from pages.cores.portfolio_optimizer import PortfolioOptimizer
+from pages.cores.yf_session import YF_SESSION
 
 # Configuration
 st.set_page_config(page_title="Portfolio Optimizer", layout="wide")
@@ -182,7 +183,7 @@ with tab1:
                     start_date = end_date - timedelta(days=lookback_days + 30)
                     
                     # Download data
-                    data = yf.download(symbols, start=start_date, end=end_date, progress=False)
+                    data = yf.download(symbols, start=start_date, end=end_date, progress=False, session=YF_SESSION)
                     if isinstance(data, pd.Series):
                         data = pd.DataFrame(data)
                     
