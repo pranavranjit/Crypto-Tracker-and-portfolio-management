@@ -3,9 +3,13 @@ from __future__ import annotations
 
 import logging
 import time
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Dict, Optional
+from urllib.parse import urlencode
 
 import numpy as np
 import pandas as pd
@@ -25,6 +29,7 @@ from sklearn.metrics import confusion_matrix, classification_report
 # --------------------------- NLTK (quiet one-time)
 nltk.download("vader_lexicon", quiet=True)
 nltk.download("punkt", quiet=True)
+nltk.download("punkt_tab", quiet=True)  # word_tokenize needs this on NLTK >= 3.9
 nltk.download("stopwords", quiet=True)
 nltk.download("wordnet", quiet=True)
 
@@ -172,7 +177,13 @@ def _preprocess_text(txt: str) -> str:
     lemmas = [_LEM.lemmatize(t.lower()) for t in keep]
     return " ".join(lemmas)
 
-def stage2_add_columns(df_raw: pd.DataFrame) -> pd.DataFrame:
+def stage2_add_columns(df_raw: pd.DataFrame, preprocess: bool = True) -> pd.DataFrame:
+    """Normalise dates and build ``all_text`` (title + body) for scoring.
+
+    ``preprocess`` also adds ``reviewText`` (tokenised, stop-word-free,
+    lemmatised body). VADER scores ``all_text``, so the live dashboard skips
+    that step: tokenising thousands of articles was the slowest part of a load.
+    """
     df = df_raw.copy()
 
     # ensure expected columns exist
@@ -190,10 +201,11 @@ def stage2_add_columns(df_raw: pd.DataFrame) -> pd.DataFrame:
     df["date"] = df["date"].dt.normalize()
 
     # preprocessed/body and combined text
-    try:
-        df["reviewText"] = df["body"].astype(str).progress_apply(_preprocess_text)
-    except Exception:
-        df["reviewText"] = df["body"].astype(str).apply(_preprocess_text)
+    if preprocess:
+        try:
+            df["reviewText"] = df["body"].astype(str).progress_apply(_preprocess_text)
+        except Exception:
+            df["reviewText"] = df["body"].astype(str).apply(_preprocess_text)
 
     df["all_text"] = df["title"].fillna("").astype(str) + " " + df["body"].fillna("").astype(str)
 
@@ -458,28 +470,118 @@ def _stage3_score_only(df_clean: pd.DataFrame, *, thr: float = 0.05) -> pd.DataF
     return df_final
 
 
+# --------------------------- Keyless fallback: Google News RSS headlines
+# CoinDesk's data API answers 401 without a key, which left the dashboard
+# empty for anyone running the app without one. Google News exposes search
+# results as RSS with no key, and its after:/before: operators reach back
+# months, so a handful of weekly windows rebuild a daily sentiment series.
+GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
+MARKET_NEWS_QUERY = (
+    '("stock market" OR "S&P 500" OR "mutual funds" OR "Federal Reserve" OR bitcoin)'
+)
+_RSS_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    )
+}
+
+
+def _google_news_window(query: str, start: datetime, end: datetime) -> list:
+    q = f"{query} after:{start:%Y-%m-%d} before:{end:%Y-%m-%d}"
+    url = f"{GOOGLE_NEWS_RSS}?" + urlencode({"q": q, "hl": "en-US", "gl": "US", "ceid": "US:en"})
+    try:
+        resp = requests.get(url, headers=_RSS_HEADERS, timeout=20)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+    except Exception as e:
+        logging.error("Google News window %s..%s failed: %s", start.date(), end.date(), e)
+        return []
+
+    rows = []
+    for item in root.findall("./channel/item"):
+        title = (item.findtext("title") or "").strip()
+        source = (item.findtext("source") or "").strip()
+        # Google appends " - Publisher" to every headline; that is not sentiment.
+        if source and title.endswith(f" - {source}"):
+            title = title[: -(len(source) + 3)]
+        try:
+            published = parsedate_to_datetime(item.findtext("pubDate") or "")
+        except (TypeError, ValueError):
+            continue
+        rows.append({"date": published, "title": title, "source": source, "url": item.findtext("link")})
+    return rows
+
+
+def fetch_headlines_rss(
+    start_dt: datetime,
+    end_dt: datetime,
+    query: str = MARKET_NEWS_QUERY,
+    window_days: int = 7,
+) -> pd.DataFrame:
+    """Market headlines from Google News RSS, fetched in parallel weekly windows."""
+    windows = []
+    cur = end_dt
+    while cur > start_dt:
+        ws = max(start_dt, cur - timedelta(days=window_days))
+        windows.append((ws, cur + timedelta(days=1)))
+        cur = ws
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        batches = list(pool.map(lambda w: _google_news_window(query, *w), windows))
+
+    df = pd.DataFrame([row for batch in batches for row in batch])
+    if df.empty:
+        return df
+    df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
+    df = df.dropna(subset=["date"]).drop_duplicates(subset=["title"])
+    lo = pd.Timestamp(start_dt, tz="UTC")
+    df = df[df["date"] >= lo].sort_values("date").reset_index(drop=True)
+    df["id"] = np.arange(len(df))
+    df["body"] = ""  # headlines only
+    df["positive"] = np.nan
+    logging.info("Fetched %d headlines from Google News RSS.", len(df))
+    return df[["date", "id", "title", "body", "source", "url", "positive"]]
+
+
 def run_sentiment_pipeline_live(
     *,
     api_key: Optional[str] = None,
     start_dt: Optional[datetime] = None,
     end_dt: Optional[datetime] = None,
     thr: float = 0.05,
+    fallback_days: int = 91,
 ) -> Dict[str, object]:
-    """End-to-end pipeline with NO disk read/write. Downloads fresh news from
-    CoinDesk, runs preprocessing + VADER, returns df_final and regime signals."""
+    """End-to-end pipeline with NO disk read/write, returning df_final, regime
+    signals and the news source used.
+
+    With a CoinDesk key it scores CoinDesk articles (default: last 365 days).
+    Without one, or if CoinDesk returns nothing, it scores Google News market
+    headlines over the last ``fallback_days`` instead.
+    """
     if end_dt is None:
         end_dt = datetime.utcnow()
     if start_dt is None:
         start_dt = end_dt - timedelta(days=365)
 
-    df_stage1 = _stage1_in_memory(api_key, start_dt, end_dt)
+    df_stage1, source = pd.DataFrame(), None
+    if api_key:
+        df_stage1 = _stage1_in_memory(api_key, start_dt, end_dt)
+        source = "CoinDesk news API"
     if df_stage1.empty:
-        return {"signals": _compute_regime_signals(pd.DataFrame()), "df_final": pd.DataFrame()}
+        fb_start = max(start_dt, end_dt - timedelta(days=fallback_days))
+        df_stage1 = fetch_headlines_rss(fb_start, end_dt)
+        source = "Google News market headlines (RSS)"
+    if df_stage1.empty:
+        return {
+            "signals": _compute_regime_signals(pd.DataFrame()),
+            "df_final": pd.DataFrame(),
+            "source": None,
+        }
 
-    df_stage2 = stage2_add_columns(df_stage1)
+    df_stage2 = stage2_add_columns(df_stage1, preprocess=False)
     df_final = _stage3_score_only(df_stage2, thr=thr)
     signals = _compute_regime_signals(df_final)
-    return {"signals": signals, "df_final": df_final}
+    return {"signals": signals, "df_final": df_final, "source": source}
 
 
 def run_sentiment_pipeline(

@@ -40,8 +40,6 @@ from pages.cores.reader import (
 )
 
 from pages.cores.commons import FEATURES, MODELS
-
-See FUND_ANALYSIS_GUIDE.md for detailed usage examples and integration patterns.
 """
 
 __version__ = "1.0.0"

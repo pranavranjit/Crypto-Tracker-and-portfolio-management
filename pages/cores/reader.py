@@ -3,63 +3,51 @@ import numpy as np
 
 
 def clean_fund_df(df):
-    # Ensure 'date' is datetime and sorted
+    """Tidy each symbol's rows on its own trading calendar.
+
+    Sorts by date, drops duplicate dates, turns +/-inf into NaN, interpolates
+    interior numeric gaps and drops rows that are still incomplete.
+
+    Rows are deliberately NOT expanded to calendar days. Doing that and
+    forward-filling copied Friday's return into Saturday and Sunday, so every
+    backtest compounded it three times and reported returns no fund earned.
+    """
     if df.empty:
         return df
-    
-    df["date"] = pd.to_datetime(df["date"], errors='coerce')
-    df = df.sort_values("date").reset_index(drop=True)
 
-    symbols = df["symbol"].unique()
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+
     cleaned_list = []
-
-    for symbol in symbols:
-        sub_df = df[df["symbol"] == symbol].copy()
-        
-        if sub_df.empty:
-            continue
-
-        # Full daily date range for this symbol
-        full_range = pd.DataFrame(
-            {
-                "date": pd.date_range(
-                    sub_df["date"].min(), sub_df["date"].max(), freq="D"
-                )
-            }
+    for _, sub_df in df.groupby("symbol", sort=False):
+        sub_df = (
+            sub_df.sort_values("date")
+            .drop_duplicates(subset="date", keep="last")
+            .reset_index(drop=True)
         )
-        full_range["symbol"] = symbol
-
-        # Merge to show missing dates as NaN
-        merged = pd.merge(full_range, sub_df, on=["symbol", "date"], how="left")
-
-        # Gap detection
-        day_diff = merged["date"].diff().dt.days
-
-        # Forward fill for 1-day gaps (only numeric columns)
-        numeric_cols = merged.select_dtypes(include=[np.number]).columns
-        ffill_mask = day_diff.eq(1)
-        merged.loc[ffill_mask, numeric_cols] = merged.loc[ffill_mask, numeric_cols].ffill()  # type: ignore
-
-        # Interpolate for longer gaps (>1 day) only on numeric columns
-        merged[numeric_cols] = (
-            merged[numeric_cols]
-            .infer_objects(copy=False)  # Fixes future warning # type: ignore
-            .interpolate(method="linear", limit_direction="forward", axis=0)
+        numeric_cols = sub_df.select_dtypes(include=[np.number]).columns
+        sub_df[numeric_cols] = (
+            sub_df[numeric_cols]
+            .replace([np.inf, -np.inf], np.nan)
+            .interpolate(method="linear", limit_area="inside", axis=0)
         )
-
-        cleaned_list.append(merged)
+        cleaned_list.append(sub_df.dropna(subset=numeric_cols))
 
     if not cleaned_list:
         return df  # Return original if no cleaned data
-    
-    cleaned_df = pd.concat(cleaned_list, ignore_index=True)
-    return cleaned_df
+
+    return pd.concat(cleaned_list, ignore_index=True)
 
 
 def addReturns(df):
     df["return"] = df["close"].pct_change()
     df["log_return"] = np.log(df["close"]) - np.log(df["close"].shift(1))
-    df["return_target"] = df["return"].shift(1)  # 1-day lagged target
+    # What the models learn to predict: the NEXT day's return. Features on day
+    # t only use prices up to t, so a forecast made at t's close can be traded
+    # and is scored against t+1. (This was shift(1), yesterday's return, which
+    # the features already contained.)
+    df["return_target"] = df["return"].shift(-1)
     df = df.dropna().reset_index(drop=True)  # remove NaNs and reset index
     return df
 
@@ -96,8 +84,14 @@ def add_ohlc_features(df, window=14):
 
 
 def add_volume_and_technical_features(df, window=14, bollinger_k=2):
-    # Volume-based features
-    df["volume_ratio"] = df["usd_volume"] / df["usd_volume"].rolling(window).mean()
+    # Volume-based features. Mutual funds trade once a day at NAV and Yahoo
+    # reports their volume as 0, which made this 0/0 and silently dropped every
+    # mutual fund from the app. No volume means no volume signal: use a
+    # neutral ratio of 1 (NaN is kept only for the rolling warm-up rows).
+    volume = df["usd_volume"].astype(float)
+    avg_volume = volume.rolling(window).mean()
+    ratio = volume / avg_volume.where(avg_volume > 0)
+    df["volume_ratio"] = ratio.where(avg_volume.isna() | (avg_volume > 0), 1.0)
     df["intraday_range"] = (df["high"] - df["low"]) / df["low"]
     df["close_to_high"] = (df["high"] - df["close"]) / df["high"]
     df["close_to_low"] = (df["close"] - df["low"]) / df["low"]

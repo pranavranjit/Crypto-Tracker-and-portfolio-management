@@ -238,26 +238,59 @@ class PortfolioOptimizer:
         metrics = self.calculate_metrics(returns_df)
         mean_returns = metrics['mean_returns'].values
         cov_matrix = metrics['cov_matrix'].values
-        
+
         num_assets = len(returns_df.columns)
-        results = np.zeros((3, num_portfolios))
-        np.random.seed(42)
-        
-        for i in range(num_portfolios):
-            # Random weights
-            weights = np.random.random(num_assets)
-            weights /= np.sum(weights)
-            
-            # Calculate metrics
-            port_return, port_std, sharpe = self.portfolio_performance(
-                weights, mean_returns, cov_matrix
+        # Dirichlet(1) samples the long-only weight simplex uniformly (dividing
+        # uniform draws by their sum crowds portfolios towards equal weight).
+        rng = np.random.default_rng(42)
+        weights = rng.dirichlet(np.ones(num_assets), size=num_portfolios)
+        rets = weights @ mean_returns
+        stds = np.sqrt(np.einsum('ij,jk,ik->i', weights, cov_matrix, weights))
+        sharpes = (rets - self.risk_free_rate) / stds
+        return rets, stds, sharpes
+
+    def efficient_frontier_curve(self,
+                                 returns_df: pd.DataFrame,
+                                 num_points: int = 40) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        The actual long-only efficient frontier: for evenly spaced target
+        returns between the minimum-variance portfolio and the best single
+        asset, the lowest volatility any fully-invested mix can achieve.
+
+        Returns:
+            Tuple of (volatilities, returns), both annualized
+        """
+        metrics = self.calculate_metrics(returns_df)
+        mean_returns = metrics['mean_returns'].values
+        cov_matrix = metrics['cov_matrix'].values
+        n = len(mean_returns)
+        if n < 2:
+            return np.array([]), np.array([])
+
+        start = self.min_variance_portfolio(returns_df)
+        targets = np.linspace(start['return'], mean_returns.max(), num_points)
+        bounds = tuple((0, 1) for _ in range(n))
+        x0 = np.asarray(start['weights'], dtype=float)
+        vols, rets = [], []
+        for target in targets:
+            cons = (
+                {'type': 'eq', 'fun': lambda x: np.sum(x) - 1},
+                {'type': 'eq', 'fun': lambda x, t=target: x @ mean_returns - t},
             )
-            
-            results[0,i] = port_return
-            results[1,i] = port_std
-            results[2,i] = sharpe
-        
-        return results[0], results[1], results[2]
+            res = minimize(
+                lambda w: w @ cov_matrix @ w,
+                x0,
+                method='SLSQP',
+                bounds=bounds,
+                constraints=cons,
+                options={'ftol': 1e-10, 'maxiter': 200},
+            )
+            if not res.success:
+                continue
+            x0 = res.x  # warm start the next, slightly higher, target
+            vols.append(float(np.sqrt(res.x @ cov_matrix @ res.x)))
+            rets.append(float(res.x @ mean_returns))
+        return np.array(vols), np.array(rets)
     
     def min_variance_portfolio(self, 
                               returns_df: pd.DataFrame) -> Dict:
